@@ -1,28 +1,40 @@
 import cv2
+import os
+import csv
 from ultralytics import YOLO
+import matplotlib.pyplot as plt
 
 # -------------------------
 # CONFIG
 # -------------------------
 
-# Path to your input video file
-INPUT_VIDEO_PATH = "test9.mp4"  # change this to your video filename
-OUTPUT_VIDEO_PATH = "output_test9.mp4"
+INPUT_VIDEO_PATH = "sania_test2.mp4"
+OUTPUT_VIDEO_PATH = "output_sania_test2.mp4"
 
-# Classes we consider as "objects of interest" for unattended detection
+# Folder for all annotated frames
+ALL_FRAMES_DIR = "frames_all"
+# Folder for unattended-event frames
+DEBUG_FRAME_DIR = "debug_frames"
+# CSV log file
+LOG_CSV_PATH = "unattended_log.csv"
+# Timeline plot
+TIMELINE_PNG_PATH = "unattended_timeline.png"
+
+# Create directories
+os.makedirs(ALL_FRAMES_DIR, exist_ok=True)
+os.makedirs(DEBUG_FRAME_DIR, exist_ok=True)
+
+# Object classes to monitor
 OBJECT_CLASSES = {"backpack", "handbag", "suitcase", "laptop", "book", "cell phone"}
 
-# Radius in pixels for "person near object"
+# Person–object distance logic
 NEAR_RADIUS_PIXELS = 150
-
-# How long (seconds) an object must be alone after being attended to be flagged as unattended
 UNATTENDED_THRESHOLD_SECONDS = 5.0
-
-# How long to keep a lost object track before dropping it (seconds)
 OBJECT_MAX_AGE_SECONDS = 5.0
-
-# IoU threshold to match detections across frames
 IOU_MATCH_THRESHOLD = 0.3
+
+# Save all frames as images?
+SAVE_ALL_FRAMES = True
 
 
 # -------------------------
@@ -30,7 +42,6 @@ IOU_MATCH_THRESHOLD = 0.3
 # -------------------------
 
 def iou_xyxy(box1, box2):
-    """Compute IoU between two [x1, y1, x2, y2] boxes."""
     x1 = max(box1[0], box2[0])
     y1 = max(box1[1], box2[1])
     x2 = min(box1[2], box2[2])
@@ -64,25 +75,29 @@ def center_distance(b1, b2):
 
 
 # -------------------------
-# TRACKED OBJECT CLASS
+# TRACKED OBJECT
 # -------------------------
 
 class TrackedObject:
     def __init__(self, obj_id, cls_name, bbox, now_ts):
         self.id = obj_id
         self.cls_name = cls_name
-        self.bbox = bbox  # [x1, y1, x2, y2]
-        self.state = "unknown"  # unknown, attended, unattended_candidate, unattended
+        self.bbox = bbox
 
+        self.state = "unknown"  # unknown, attended, unattended_candidate, unattended
         self.last_seen_time = now_ts
         self.last_time_with_person_nearby = None
         self.alone_since = None
+
+        self.unattended_saved = False  # to avoid saving multiple frames for same object
 
     def update_bbox(self, bbox, now_ts):
         self.bbox = bbox
         self.last_seen_time = now_ts
 
     def update_state(self, person_nearby, now_ts):
+        prev_state = self.state
+
         if person_nearby:
             self.last_time_with_person_nearby = now_ts
             self.alone_since = None
@@ -101,32 +116,41 @@ class TrackedObject:
                     if self.last_time_with_person_nearby is not None:
                         self.state = "unattended"
 
+        return prev_state, self.state
+
 
 # -------------------------
 # MAIN
 # -------------------------
 
 def main():
-    # Load YOLO model
     model = YOLO("yolov8n.pt")
 
-    # Open input video
     cap = cv2.VideoCapture(INPUT_VIDEO_PATH)
     if not cap.isOpened():
-        raise RuntimeError(f"Could not open input video: {INPUT_VIDEO_PATH}")
+        raise RuntimeError(f"Cannot open input video: {INPUT_VIDEO_PATH}")
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    fps = fps if fps and fps > 0 else 25.0  # fallback
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Output video writer
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(OUTPUT_VIDEO_PATH, fourcc, fps, (width, height))
+    out = cv2.VideoWriter(
+        OUTPUT_VIDEO_PATH,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (width, height),
+    )
 
     tracked_objects = []
     next_obj_id = 1
     frame_idx = 0
+
+    # CSV log rows
+    log_rows = []
+
+    # Timeline data
+    timeline_times = []
+    timeline_unattended_counts = []
 
     while True:
         ret, frame = cap.read()
@@ -134,37 +158,31 @@ def main():
             break
 
         frame_idx += 1
-        now_ts = frame_idx / fps  # use video time instead of wall-clock time
+        now_ts = frame_idx / fps
 
-        # -------------------------
-        # Step 1: YOLO detection
-        # -------------------------
+        # 1) YOLO detections
         results = model(frame, verbose=False)
         res = results[0]
 
         persons = []
-        object_detections = []  # list of (bbox, cls_name)
+        objs = []
 
         if res.boxes is not None:
             for box in res.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
-                cls_id = int(box.cls[0].item())
-                conf = float(box.conf[0].item())
-                cls_name = model.names.get(cls_id, str(cls_id))
-
+                cls_id = int(box.cls[0])
+                cls_name = model.names[cls_id]
                 bbox = [int(x1), int(y1), int(x2), int(y2)]
 
                 if cls_name == "person":
                     persons.append(bbox)
                 elif cls_name in OBJECT_CLASSES:
-                    object_detections.append((bbox, cls_name))
+                    objs.append((bbox, cls_name))
 
-        # -------------------------
-        # Step 2: Match detections to tracked objects (IoU-based)
-        # -------------------------
+        # 2) IoU-based object tracking
         seen_ids = set()
 
-        for det_bbox, det_cls in object_detections:
+        for det_bbox, det_cls in objs:
             best_iou = 0.0
             best_obj = None
 
@@ -185,53 +203,57 @@ def main():
                 seen_ids.add(next_obj_id)
                 next_obj_id += 1
 
-        # -------------------------
-        # Step 3: Update state for objects seen this frame
-        # -------------------------
-        for obj in tracked_objects:
-            if obj.id in seen_ids:
-                person_nearby = False
-                for p_bbox in persons:
-                    dist = center_distance(obj.bbox, p_bbox)
-                    if dist < NEAR_RADIUS_PIXELS:
-                        person_nearby = True
-                        break
-                obj.update_state(person_nearby, now_ts)
-
-        # -------------------------
-        # Step 4: Remove stale tracks
-        # -------------------------
-        tracked_objects = [
-            obj
-            for obj in tracked_objects
-            if (now_ts - obj.last_seen_time) <= OBJECT_MAX_AGE_SECONDS
-        ]
-
-        # -------------------------
-        # Step 5: Draw results
-        # -------------------------
+        # 3) Update states + detect transitions
         for obj in tracked_objects:
             if obj.id not in seen_ids:
-                continue  # draw only objects present in this frame
+                continue
+
+            person_near = any(
+                center_distance(obj.bbox, p_bbox) < NEAR_RADIUS_PIXELS
+                for p_bbox in persons
+            )
+
+            prev_state, curr_state = obj.update_state(person_near, now_ts)
+
+            # Save frame when object becomes unattended
+            if curr_state == "unattended" and not obj.unattended_saved:
+                fname = (
+                    f"{DEBUG_FRAME_DIR}/frame_{frame_idx:05d}_"
+                    f"obj{obj.id}_{obj.cls_name}_t{now_ts:.2f}.jpg"
+                )
+                cv2.imwrite(fname, frame)
+                obj.unattended_saved = True
+
+        # 4) Remove stale tracks
+        tracked_objects = [
+            o for o in tracked_objects
+            if (now_ts - o.last_seen_time) <= OBJECT_MAX_AGE_SECONDS
+        ]
+
+        # 5) Draw and count unattended
+        unattended_count = 0
+
+        for obj in tracked_objects:
+            if obj.id not in seen_ids:
+                continue
 
             x1, y1, x2, y2 = obj.bbox
 
             if obj.state == "attended":
-                color = (0, 255, 0)        # Green
+                color = (0, 255, 0)
             elif obj.state == "unattended_candidate":
-                color = (0, 255, 255)      # Yellow
+                color = (0, 255, 255)
             elif obj.state == "unattended":
-                color = (0, 0, 255)        # Red
+                color = (0, 0, 255)
+                unattended_count += 1
             else:
-                color = (255, 255, 255)    # White
+                color = (255, 255, 255)
 
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-            label = f"{obj.cls_name}:{obj.state}"
             cv2.putText(
                 frame,
-                label,
-                (x1, max(0, y1 - 10)),
+                f"{obj.cls_name}:{obj.state}",
+                (x1, max(0, y1 - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
                 color,
@@ -239,13 +261,21 @@ def main():
                 cv2.LINE_AA,
             )
 
-        # Optional: visualize persons (blue boxes)
+            # Log per-object state for this frame
+            log_rows.append([
+                frame_idx,
+                f"{now_ts:.3f}",
+                obj.id,
+                obj.cls_name,
+                obj.state,
+            ])
+
+        # Optionally draw persons (blue)
         for p_bbox in persons:
             px1, py1, px2, py2 = p_bbox
             cv2.rectangle(frame, (px1, py1), (px2, py2), (255, 0, 0), 1)
             cv2.putText(
-                frame,
-                "person",
+                frame, "person",
                 (px1, max(0, py1 - 5)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.4,
@@ -254,17 +284,44 @@ def main():
                 cv2.LINE_AA,
             )
 
-        # Write to output video
+        # Write annotated frame to video
         out.write(frame)
 
-        # If you want to preview while processing, uncomment:
-        # cv2.imshow("Unattended Object Detection (Video)", frame)
+        # Save all frames as images (if enabled)
+        if SAVE_ALL_FRAMES:
+            all_frame_name = f"{ALL_FRAMES_DIR}/frame_{frame_idx:05d}.jpg"
+            cv2.imwrite(all_frame_name, frame)
+
+        # Update timeline arrays
+        timeline_times.append(now_ts)
+        timeline_unattended_counts.append(unattended_count)
+
+        # If you want preview:
+        # cv2.imshow("Video", frame)
         # if cv2.waitKey(1) & 0xFF == ord("q"):
         #     break
 
     cap.release()
     out.release()
     cv2.destroyAllWindows()
+
+    # 6) Write CSV log
+    with open(LOG_CSV_PATH, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["frame_idx", "time_sec", "object_id", "class_name", "state"])
+        writer.writerows(log_rows)
+
+    # 7) Plot unattended timeline
+    if timeline_times:
+        plt.figure(figsize=(8, 4))
+        plt.plot(timeline_times, timeline_unattended_counts, linewidth=2)
+        plt.xlabel("Time (s)")
+        plt.ylabel("Number of unattended objects")
+        plt.title("Unattended objects over time")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(TIMELINE_PNG_PATH, dpi=200)
+        plt.close()
 
 
 if __name__ == "__main__":
